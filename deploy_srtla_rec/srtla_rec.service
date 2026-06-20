@@ -1,15 +1,39 @@
 [Unit]
-Description=srtla receive service
-After=network.target
+Description=srtla receive service (SRTLA -> SRT relay)
+Documentation=https://github.com/Bittersweet1987/srtla
+After=network-online.target
+Wants=network-online.target
 
 [Service]
+# Port/Server-Konfiguration kommt aus /etc/default/srtla_rec
 EnvironmentFile=/etc/default/srtla_rec
 ExecStart=/usr/local/bin/srtla_rec $SRTLA_LISTEN_PORT $SRT_ADDR
-KillMode=process
+
+# Bei Absturz automatisch neu starten (kurze Pause gegen Restart-Schleifen)
 Restart=on-failure
-NoNewPrivileges=true
+RestartSec=2
+KillMode=process
+
+# --- Rechte-Minimierung / Sandbox -----------------------------------------
+# Als unprivilegierter Nutzer laufen
 User=nobody
 Group=nogroup
+# Keine zusaetzlichen Rechte durch setuid-Binaries erlangen koennen
+NoNewPrivileges=true
+# Dateisystem weitgehend schreibgeschuetzt und isoliert
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true            # nur /dev/null, /dev/urandom etc. sichtbar
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+# srtla_rec braucht nur IPv4/IPv6-UDP-Sockets
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target

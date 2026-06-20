@@ -16,6 +16,33 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/* ===========================================================================
+   srtla_send.c - SRTLA-Sender (laeuft auf der Streaming-Seite, z. B. Belabox).
+
+   AUFGABE
+   -------
+   Eine lokale SRT-Anwendung (OBS, srt-live-transmit, ...) streamt im
+   Caller-Modus an SRT_LISTEN_PORT auf diesem Rechner. Der Sender verteilt
+   die einzelnen UDP-Pakete dieses Stroms auf mehrere Netzwerk-Links
+   (mehrere Modems, jeweils per Quell-IP gebunden) und schickt sie an den
+   SRTLA-Receiver. Antworten des Receivers/SRT-Servers werden zurueck an die
+   lokale SRT-Anwendung gereicht.
+
+   LASTVERTEILUNG (Kernidee)
+   -------------------------
+   Pro Link wird ein dynamisches "Fenster" (window) gefuehrt, das grob die
+   Kapazitaet des Links abbildet - aehnlich wie bei der TCP-Staukontrolle.
+   Zusammen mit der Anzahl "in-flight" (gesendet, aber noch nicht bestaetigt)
+   Pakete ergibt sich ein Score; das naechste Paket geht an den Link mit dem
+   besten Score (siehe select_conn()). NAKs (Verluste) verkleinern das
+   Fenster, ACKs vergroessern es langsam wieder.
+
+   Hinweis: Dieser Sender ist fuer dein Setup zweitrangig (auf der Belabox
+   laeuft i. d. R. die dort mitgelieferte Version). Er wird hier vollstaendig
+   mitgepflegt und kommentiert, damit das Gesamtbild stimmt und der Code als
+   Referenz dient.
+   =========================================================================== */
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,65 +58,69 @@
 
 #include "common.h"
 
-#define PKT_LOG_SZ 256
-#define CONN_TIMEOUT 4
-#define REG2_TIMEOUT 4
-#define REG3_TIMEOUT 4
-#define GLOBAL_TIMEOUT 10
-#define IDLE_TIME 1
+#define PKT_LOG_SZ 256      // Ringpuffergroesse pro Link fuer gesendete Seq.-Nummern
+#define CONN_TIMEOUT 4      // Link gilt nach 4 s ohne Empfang als ausgefallen
+#define REG2_TIMEOUT 4      // Wartezeit auf REG2 nach gesendetem REG1
+#define REG3_TIMEOUT 4      // Wartezeit auf REG3 nach gesendetem REG2
+#define GLOBAL_TIMEOUT 10   // alle Links aus -> nach 10 s naechste Receiver-Adresse/Exit
+#define IDLE_TIME 1         // nach 1 s Sendepause ein Keepalive schicken
 
-#define SEND_BUF_SIZE (8 * 1024 * 1024)
+#define SEND_BUF_SIZE (8 * 1024 * 1024)   // 8 MB Sendepuffer je Link-Socket
 
 #define min(a, b) ((a < b) ? a : b)
 #define max(a, b) ((a > b) ? a : b)
 #define min_max(a, l, h) (max(min((a), (h)), (l)))
 
+/* Fenster-Parameter der Lastverteilung. Das Fenster wird intern mit dem
+   Faktor WINDOW_MULT skaliert gefuehrt, um ohne Gleitkomma feiner regeln zu
+   koennen. */
 #define WINDOW_MIN 1
 #define WINDOW_DEF 20
 #define WINDOW_MAX 60
 #define WINDOW_MULT 1000
-#define WINDOW_DECR 100
-#define WINDOW_INCR 30
+#define WINDOW_DECR 100    // Fensterverkleinerung bei einem NAK (Verlust)
+#define WINDOW_INCR 30     // Fenstervergroesserung bei einer SRTLA-ACK
 
-#define LOG_PKT_INT 20
+#define LOG_PKT_INT 20     // wie oft (in Schleifendurchlaeufen) Debug-Status geloggt wird
 
+/* Ein einzelner ausgehender Link. */
 typedef struct conn {
   struct conn *next;
-  int fd;
-  time_t last_rcvd;
-  time_t last_sent;
-  struct sockaddr src;
-  int removed;
-  int in_flight_pkts;
-  int window;
-  int pkt_idx;
-  int pkt_log[PKT_LOG_SZ];
+  int fd;                  // UDP-Socket dieses Links (-1 = geschlossen)
+  time_t last_rcvd;        // letzter Empfang vom Receiver (Timeout/Reconnect)
+  time_t last_sent;        // letzter eigener Versand (fuer Keepalive-Takt)
+  struct sockaddr src;     // Quell-IP, an die dieser Link gebunden wird
+  int removed;             // Markierung beim Neu-Einlesen der IP-Liste (SIGHUP)
+  int in_flight_pkts;      // gesendet, aber noch nicht bestaetigt
+  int window;              // aktuelles Kapazitaetsfenster (skaliert mit WINDOW_MULT)
+  int pkt_idx;             // Schreibindex in pkt_log
+  int pkt_log[PKT_LOG_SZ]; // Ringpuffer gesendeter Sequenznummern (-1 = leer/bestaetigt)
 } conn_t;
 
 char *source_ip_file = NULL;
 
-int do_update_conns = 0;
+int do_update_conns = 0;   // wird vom SIGHUP-Handler gesetzt (IP-Liste neu lesen)
 
-struct addrinfo *addrs;
+struct addrinfo *addrs;    // aufgeloeste Adressen des Receivers (mehrere moeglich)
 
 struct sockaddr srtla_addr, srt_addr;
 const socklen_t addr_len = sizeof(srtla_addr);
 conn_t *conns = NULL;
-int listenfd;
+int listenfd;              // lokaler Socket, auf dem die SRT-Anwendung sendet
 int active_connections = 0;
-int has_connected = 0;
+int has_connected = 0;     // ob ueberhaupt jemals eine Verbindung stand
 
-conn_t *pending_reg2_conn = NULL;
+conn_t *pending_reg2_conn = NULL;  // Link, fuer den wir gerade auf REG2 warten
 time_t pending_reg_timeout = 0;
 
-char srtla_id[SRTLA_ID_LEN];
+char srtla_id[SRTLA_ID_LEN];       // unsere Gruppen-ID (Senderhaelfte zufaellig)
 
 
-/*
-
-Async I/O support
-
-*/
+/* ===========================================================================
+   Async-I/O via select()
+   Der Sender nutzt select() (statt epoll), weil die Zahl der Sockets klein
+   und fix ist. active_fds enthaelt alle zu ueberwachenden Deskriptoren.
+   =========================================================================== */
 fd_set active_fds;
 int max_act_fd = -1;
 
@@ -111,11 +142,9 @@ int remove_active_fd(int fd) {
 }
 
 
-/*
-
-Misc helper functions
-
-*/
+/* ===========================================================================
+   Kleine Helfer
+   =========================================================================== */
 void print_help() {
   fprintf(stderr,
           "Syntax: srtla_send SRT_LISTEN_PORT SRTLA_HOST SRTLA_PORT BIND_IPS_FILE\n\n"
@@ -123,11 +152,9 @@ void print_help() {
 }
 
 
-/*
-
-srtla registration helpers
-
-*/
+/* ===========================================================================
+   SRTLA-Registrierungs-Helfer (REG1/REG2 senden)
+   =========================================================================== */
 int send_reg1(conn_t *c) {
   if (c->fd < 0) return -1;
 
@@ -155,11 +182,12 @@ int send_reg2(conn_t *c) {
 }
 
 
-/*
+/* ===========================================================================
+   Pakete von der lokalen SRT-Anwendung (Caller) verarbeiten
+   =========================================================================== */
 
-Handling code for packets coming from the SRT caller
-
-*/
+/* Eine gesendete Sequenznummer im Ringpuffer des Links vermerken und
+   in_flight hochzaehlen. */
 void reg_pkt(conn_t *c, int32_t packet) {
   debug("%s (%p): register packet %d at idx %d\n",
         print_addr(&c->src), c, packet, c->pkt_idx);
@@ -174,6 +202,9 @@ int conn_timed_out(conn_t *c, time_t ts) {
   return (c->last_rcvd + CONN_TIMEOUT) < ts;
 }
 
+/* Den besten Link fuer das naechste Paket waehlen.
+   Score = window / (in_flight + 1): viel freie Kapazitaet und wenige
+   unbestaetigte Pakete -> hoher Score. Abgelaufene Links werden uebersprungen. */
 conn_t *select_conn() {
   conn_t *min_c = NULL;
   int max_score = -1;
@@ -189,11 +220,10 @@ conn_t *select_conn() {
   assert(get_seconds(&t) == 0);
 
   for (conn_t *c = conns; c != NULL; c = c->next) {
-    /* If we have some very slow links, we may be better off ignoring them
-       However, we'd probably need to periodically re-probe them, otherwise
-       a link disabled due to a momentary glitch might not ever get enabled
-       again unless all the remaining links suffered from high packet loss
-       at some point. */
+    /* Sehr langsame Links koennten wir ganz ignorieren. Dann muesste man sie
+       aber periodisch wieder antesten, sonst bleibt ein wegen einer kurzen
+       Stoerung deaktivierter Link evtl. fuer immer aus. Daher hier
+       auskommentiert belassen. */
     /*if (c->window < max_window / 5) {
       c->window++;
       continue;
@@ -218,6 +248,8 @@ conn_t *select_conn() {
   return min_c;
 }
 
+/* Daten von der lokalen SRT-Anwendung -> ueber den gewaehlten Link an den
+   Receiver schicken und die Sequenznummer vermerken. */
 void handle_srt_data(int fd) {
   char buf[MTU];
   socklen_t len = sizeof(srt_addr);
@@ -232,8 +264,9 @@ void handle_srt_data(int fd) {
         reg_pkt(c, sn);
       }
     } else {
-      /* If sending the packet fails, adjust the timestamp to disable the link until a
-         reconnection is confirmed. 1 so connection_housekeeping() prints its message */
+      /* Schlaegt das Senden fehl, deaktivieren wir den Link, bis ein
+         Reconnect bestaetigt ist. last_rcvd=1 (statt 0), damit
+         connection_housekeeping() seine Meldung ausgibt. */
       c->last_rcvd = 1;
       err("%s (%p): sendto() failed, disabling the connection\n",
           print_addr(&c->src), c);
@@ -242,11 +275,11 @@ void handle_srt_data(int fd) {
 }
 
 
-/*
+/* ===========================================================================
+   Pakete vom Receiver verarbeiten
+   =========================================================================== */
 
-Handling code for packets coming from the receiver
-
-*/
+/* Index im Ringpuffer um "increment" verschieben (mit Wrap-around). */
 int get_pkt_idx(int idx, int increment) {
   idx = idx + increment;
   if (idx < 0) idx += PKT_LOG_SZ;
@@ -255,14 +288,15 @@ int get_pkt_idx(int idx, int increment) {
   return idx;
 }
 
+/* Ein per SRT-NAK gemeldetes verlorenes Paket suchen. Auf dem Link, der es
+   gesendet hat, das Fenster verkleinern (Verlust = Hinweis auf Ueberlast). */
 void register_nak(int32_t packet) {
   for (conn_t *c = conns; c != NULL; c = c->next) {
     int idx = get_pkt_idx(c->pkt_idx, -1);
     for (int i = idx; i != c->pkt_idx; i = get_pkt_idx(i, -1)) {
       if (c->pkt_log[i] == packet) {
         c->pkt_log[i] = -1;
-        // It might be better to use exponential decay like this
-        //c->window = c->window * 998 / 1000;
+        // Alternativ exponentieller Abfall: c->window = c->window * 998 / 1000;
         c->window -= WINDOW_DECR;
         c->window = max(c->window, WINDOW_MIN*WINDOW_MULT);
         debug("%s (%p): found NAKed packet %d in the log\n",
@@ -275,6 +309,8 @@ void register_nak(int32_t packet) {
   debug("Didn't find NAKed packet %d in our logs\n", packet);
 }
 
+/* Eine SRTLA-ACK des Receivers verarbeiten: bestaetigtes Paket finden,
+   in_flight reduzieren und das Fenster langsam vergroessern. */
 void register_srtla_ack(int32_t ack) {
   int found = 0;
 
@@ -296,6 +332,8 @@ void register_srtla_ack(int32_t ack) {
       }
     }
 
+    /* Jeder aktive Link bekommt pro ACK eine kleine Grundvergroesserung,
+       gedeckelt auf WINDOW_MAX. */
     if (c->last_rcvd != 0) {
       c->window += 1;
       c->window = min(c->window, WINDOW_MAX*WINDOW_MULT);
@@ -304,10 +342,10 @@ void register_srtla_ack(int32_t ack) {
 }
 
 /*
-  TODO after the sequence number overflows, we should probably also mark high
-  sn packets as received. However, this shouldn't normally be an issue as SRTLA
-  ACKs acknowledge each packet individually. Also, if the SRTLA ACK is lost,
-  stale entries will be overwritten soon enough as pkt_log is a circular buffer
+  TODO (aus dem Original): Nach einem Ueberlauf der Sequenznummer sollten wir
+  ggf. auch hohe Sequenznummern als empfangen markieren. Normalerweise kein
+  Problem, da SRTLA-ACKs jedes Paket einzeln bestaetigen und alte Eintraege
+  im Ringpuffer ohnehin bald ueberschrieben werden.
 */
 void conn_register_srt_ack(conn_t *c, int32_t ack) {
   int count = 0;
@@ -328,6 +366,7 @@ void register_srt_ack(int32_t ack) {
   }
 }
 
+/* Zentrale Verarbeitung aller vom Receiver eingehenden Pakete eines Links. */
 void handle_srtla_data(conn_t *c) {
   char buf[MTU];
 
@@ -339,14 +378,14 @@ void handle_srtla_data(conn_t *c) {
 
   uint16_t packet_type = get_srt_type(buf, n);
 
-  /* Handling NGPs separately because we don't want them to update last_rcvd
-     Otherwise they could be keeping failed connections marked active */
+  /* NGP/REG2 separat behandeln, BEVOR wir last_rcvd setzen - sonst koennten
+     diese Pakete einen in Wahrheit ausgefallenen Link als aktiv erscheinen
+     lassen. */
   if (packet_type == SRTLA_TYPE_REG_NGP) {
-    /* Only process NGPs if:
-       * we don't have any established connections
-       * and we don't already have a pending REG1->REG2 exhange in flight
-       * and we don't have any pending REG2->REG3 exchanges in flight
-    */
+    /* NGP nur verarbeiten, wenn:
+       * wir keine etablierten Verbindungen haben,
+       * kein REG1->REG2-Austausch laeuft,
+       * und kein REG2->REG3-Austausch aussteht. */
     if (active_connections == 0 && pending_reg2_conn == NULL && ts > pending_reg_timeout) {
       if (send_reg1(c) == 0) {
         pending_reg2_conn = c;
@@ -358,6 +397,7 @@ void handle_srtla_data(conn_t *c) {
   } else if (packet_type == SRTLA_TYPE_REG2) {
     if (pending_reg2_conn == c) {
       char *id = &buf[2];
+      // Die ersten SRTLA_ID_LEN/2 Bytes (unsere Haelfte) muessen passen
       if (memcmp(id, srtla_id, SRTLA_ID_LEN/2) != 0) {
         err("%s (%p): got a mismatching ID in SRTLA_REG2\n",
            print_addr(&c->src), c);
@@ -365,9 +405,9 @@ void handle_srtla_data(conn_t *c) {
       }
 
       info("%s (%p): connection group registered\n", print_addr(&c->src), c);
-      memcpy(srtla_id, id, SRTLA_ID_LEN);
+      memcpy(srtla_id, id, SRTLA_ID_LEN);   // vollstaendige ID uebernehmen
 
-      /* Broadcast REG2 */
+      // REG2 ueber alle Links broadcasten, um jeden Link anzumelden
       for (conn_t *i = conns; i != NULL; i = i->next) {
         send_reg2(i);
       }
@@ -382,6 +422,7 @@ void handle_srtla_data(conn_t *c) {
 
   switch(packet_type) {
     case SRT_TYPE_ACK: {
+      // Voller ACK: bestaetigt alle Pakete bis last_ack
       uint32_t last_ack = *((uint32_t *)&buf[16]);
       last_ack = be32toh(last_ack);
       register_srt_ack(last_ack);
@@ -389,36 +430,40 @@ void handle_srtla_data(conn_t *c) {
     }
 
     case SRT_TYPE_NAK: {
+      // NAK enthaelt Einzel-IDs und/oder Bereiche (oberstes Bit markiert Bereich)
       uint32_t *ids = (uint32_t *)buf;
       for (int i = 4; i < n/4; i++) {
         uint32_t id = be32toh(ids[i]);
         if (id & (1 << 31)) {
-          id = id & 0x7FFFFFFF;
-          uint32_t last_id = be32toh(ids[i+1]);
-          for (int32_t lost = id; lost <= last_id; lost++) {
-            register_nak(lost);
+          id = id & 0x7FFFFFFF;            // Bereichsanfang
+          uint32_t last_id = be32toh(ids[i+1]); // Bereichsende
+          /* Schleifenvariable bewusst unsigned, damit sie zum Typ von last_id
+             passt (behebt eine Signedness-Warnung). SRT-Sequenznummern sind
+             31-bittig, ein Ueberlauf ist hier praktisch ausgeschlossen. */
+          for (uint32_t lost = id; lost <= last_id; lost++) {
+            register_nak((int32_t)lost);
           }
-          i++;
+          i++;                              // das Bereichsende wurde mitverbraucht
         } else {
-          register_nak(id);
+          register_nak((int32_t)id);
         }
       }
       break;
     }
 
-    // srtla packets below, don't send to SRT
+    // SRTLA-eigene Pakete unten: NICHT an die SRT-Anwendung weiterreichen
     case SRTLA_TYPE_ACK: {
       uint32_t *acks = (uint32_t *)buf;
       for (int i = 1; i < n/4; i++) {
         uint32_t id = be32toh(acks[i]);
         debug("%s (%p): ack %d\n", print_addr(&c->src), c, id);
-        register_srtla_ack(id);
+        register_srtla_ack((int32_t)id);
       }
       return;
     }
     case SRTLA_TYPE_KEEPALIVE:
       debug("%s (%p): got a keepalive\n", print_addr(&c->src), c);
-      return; // don't send to SRT
+      return; // nicht an SRT weiterreichen
 
     case SRTLA_TYPE_REG3:
       has_connected = 1;
@@ -427,15 +472,14 @@ void handle_srtla_data(conn_t *c) {
       return;
   } // switch
 
+  // Normale SRT-Pakete an die lokale SRT-Anwendung weiterreichen
   sendto(listenfd, &buf, n, 0, &srt_addr, addr_len);
 }
 
 
-/*
-
-Connection and socket management
-
-*/
+/* ===========================================================================
+   Verbindungs- und Socketverwaltung
+   =========================================================================== */
 conn_t *conn_find_by_src(struct sockaddr *src) {
   for (conn_t *c = conns; c != NULL; c = c->next) {
     if (memcmp(src, &c->src, sizeof(*src)) == 0) {
@@ -446,6 +490,9 @@ conn_t *conn_find_by_src(struct sockaddr *src) {
   return NULL;
 }
 
+/* IP-Liste (eine Quell-IP pro Zeile) einlesen und fuer jede neue IP einen
+   Link anlegen. Bereits bekannte IPs werden nur "entmarkiert" (siehe
+   update_conns / SIGHUP). */
 int setup_conns(char *source_ip_file) {
   FILE *config = fopen(source_ip_file, "r");
   if (config == NULL) {
@@ -493,6 +540,9 @@ int setup_conns(char *source_ip_file) {
   return count;
 }
 
+/* IP-Liste zur Laufzeit neu einlesen (per SIGHUP angestossen): zuerst alle
+   Links als "removed" markieren, dann die Datei neu lesen (vorhandene werden
+   entmarkiert), zuletzt alle noch markierten Links abbauen. */
 void update_conns(char *source_ip_file) {
   for (conn_t *c = conns; c != NULL; c = c->next) {
     c->removed = 1;
@@ -521,10 +571,15 @@ void update_conns(char *source_ip_file) {
   }
 }
 
+/* SIGHUP-Handler: nur ein Flag setzen, die eigentliche Arbeit passiert in der
+   Hauptschleife (Signal-Handler sollen so wenig wie moeglich tun). */
 void schedule_update_conns(int signal) {
+  (void)signal;            // Parameter wird nicht gebraucht (Signatur vorgegeben)
   do_update_conns = 1;
 }
 
+/* Einen UDP-Socket fuer einen Link oeffnen und an dessen Quell-IP binden.
+   quiet unterdrueckt die Fehlermeldung beim wiederholten Reconnect-Versuch. */
 int open_socket(conn_t *c, int quiet) {
   if (c->fd >= 0) {
     remove_active_fd(c->fd);
@@ -532,7 +587,7 @@ int open_socket(conn_t *c, int quiet) {
     c->fd = -1;
   }
 
-  // Set up the socket
+  // Socket anlegen (nicht-blockierend)
   int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
   if (fd < 0) {
     err("Failed to open a socket");
@@ -546,7 +601,7 @@ int open_socket(conn_t *c, int quiet) {
     goto err;
   }
 
-  // Bind it to the source address
+  // An die Quell-Adresse binden -> dieses Paket verlaesst das jeweilige Modem
   ret = bind(fd, &c->src, sizeof(c->src));
   if (ret != 0) {
     if (!quiet) {
@@ -565,8 +620,11 @@ err:
   return -1;
 }
 
+/* Beim Start fuer jeden Link versuchen, einen Socket zu oeffnen/zu binden.
+   host/port werden hier (noch) nicht gebraucht - die Signatur bleibt aber
+   stabil fuer kuenftige Erweiterungen. */
 int open_conns(char *host, char *port) {
-  // Check that we can actually open & bind at least one socket
+  (void)host; (void)port;     // aktuell ungenutzt (behebt -Wunused-parameter)
   int opened = 0;
   for (conn_t *c = conns; c != NULL; c = c->next) {
     if (open_socket(c, 0) == 0) {
@@ -576,11 +634,9 @@ int open_conns(char *host, char *port) {
   return opened;
 }
 
-/*
-
-Connection housekeeping
-
-*/
+/* ===========================================================================
+   Verbindungs-Housekeeping (Reconnect, Keepalives, Timeouts)
+   =========================================================================== */
 void set_srtla_addr(struct addrinfo *addr) {
   memcpy(&srtla_addr, addr->ai_addr, addr->ai_addrlen);
   info("Trying to connect to %s...\n", print_addr(&srtla_addr));
@@ -589,16 +645,16 @@ void set_srtla_addr(struct addrinfo *addr) {
 void send_keepalive(conn_t *c) {
   debug("%s (%p): sending keepalive\n", print_addr(&c->src), c);
   uint16_t pkt = htobe16(SRTLA_TYPE_KEEPALIVE);
-  // ignoring the result on purpose
+  // Ergebnis bewusst ignoriert
   sendto(c->fd, &pkt, sizeof(pkt), 0, &srtla_addr, addr_len);
 }
 
 #define HOUSEKEEPING_INT 1000 // ms
 void connection_housekeeping() {
   static uint64_t all_failed_at = 0;
-  /* We use milliseconds here because with a seconds timer we may be
-     resending a second REG2 very soon after the first one, depending
-     on when the first execution happens within the seconds interval */
+  /* Millisekunden, weil wir mit einem Sekundentakt ein zweites REG2 zu schnell
+     nach dem ersten senden koennten - je nachdem, wann im Sekundenintervall
+     die Ausfuehrung faellt. */
   static uint64_t last_ran = 0;
   uint64_t ms;
   assert(get_ms(&ms) == 0);
@@ -619,8 +675,7 @@ void connection_housekeeping() {
     }
 
     if (conn_timed_out(c, time)) {
-      /* When we first detect the connection having failed,
-         we reset its status and print a message */
+      /* Beim ersten Erkennen des Ausfalls Status zuruecksetzen und melden. */
       if (c->last_rcvd > 0) {
         info("%s (%p): connection failed, attempting to reconnect\n",
              print_addr(&c->src), c);
@@ -634,8 +689,8 @@ void connection_housekeeping() {
       }
 
       if (pending_reg2_conn == NULL) {
-        /* As the connection has timed out on our end, the receiver might have garbage
-           collected it. Try to re-establish it rather than send a keepalive */
+        /* Da der Link auf unserer Seite abgelaufen ist, hat ihn der Receiver
+           evtl. schon aufgeraeumt. Lieber neu anmelden (REG2) als Keepalive. */
         send_reg2(c);
       } else if (pending_reg2_conn == c) {
         send_reg1(c);
@@ -643,8 +698,8 @@ void connection_housekeeping() {
       continue;
     }
 
-    /* If a connection has received data in the last CONN_TIMEOUT seconds,
-       then it's active */
+    /* Link, der in den letzten CONN_TIMEOUT Sekunden Daten empfangen hat,
+       gilt als aktiv. */
     active_connections++;
 
     if ((c->last_sent + IDLE_TIME) < time) {
@@ -661,7 +716,7 @@ void connection_housekeeping() {
       err("warning: no available connections\n");
     }
 
-    // Timeout when all connections have failed
+    // Alle Links aus -> nach GLOBAL_TIMEOUT reagieren
     if (ms > (all_failed_at + (GLOBAL_TIMEOUT * 1000))) {
       if (has_connected) {
         err("Failed to re-establish any connections to %s\n",
@@ -672,7 +727,7 @@ void connection_housekeeping() {
       err("Failed to establish any initial connections to %s\n",
           print_addr(&srtla_addr));
 
-      // Walk through the list of resolved addresses
+      // Naechste aufgeloeste Receiver-Adresse probieren, sonst beenden
       if (addrs->ai_next) {
         addrs = addrs->ai_next;
         set_srtla_addr(addrs);
@@ -711,7 +766,7 @@ int main(int argc, char **argv) {
   int port = parse_port(ARG_LISTEN_PORT);
   if (port < 0) exit_help();
 
-  // Read a random connection group id for this session
+  // Zufaellige Gruppen-ID fuer diese Sitzung erzeugen
   FILE *fd = fopen("/dev/urandom", "rb");
   assert(fd != NULL);
   assert(fread(srtla_id, 1, SRTLA_ID_LEN, fd) == SRTLA_ID_LEN);
@@ -719,6 +774,7 @@ int main(int argc, char **argv) {
 
   FD_ZERO(&active_fds);
 
+  // Lokalen Listener fuer die SRT-Anwendung einrichten
   listen_addr.sin_family = AF_INET;
   listen_addr.sin_addr.s_addr = INADDR_ANY;
   listen_addr.sin_port = htons(port);
@@ -741,7 +797,7 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  // Resolve the address of the receiver
+  // Adresse(n) des Receivers aufloesen
   struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
@@ -754,7 +810,9 @@ int main(int argc, char **argv) {
 
   set_srtla_addr(addrs);
 
+  // SIGHUP laedt die IP-Liste neu (Modems zur Laufzeit zu-/abschalten)
   signal(SIGHUP, schedule_update_conns);
+  signal(SIGPIPE, SIG_IGN);   // ein geschlossener Socket darf uns nicht killen
 
   int info_int = LOG_PKT_INT;
 
@@ -766,6 +824,7 @@ int main(int argc, char **argv) {
 
     connection_housekeeping();
 
+    // Auf lesbare Sockets warten (max. 200 ms, damit Housekeeping regelmaessig laeuft)
     fd_set read_fds = active_fds;
     struct timeval to = {.tv_sec = 0, .tv_usec = 200*1000};
     ret = select(FD_SETSIZE, &read_fds, NULL, NULL, &to);
@@ -782,6 +841,7 @@ int main(int argc, char **argv) {
       }
     } // ret > 0
 
+    // Gelegentlich einen Statusueberblick je Link ausgeben (nur LOG_DEBUG)
     info_int--;
     if (info_int == 0) {
       for (conn_t *c = conns; c != NULL; c = c->next) {

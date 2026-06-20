@@ -1,3 +1,73 @@
+Bittersweet1987/srtla – gepflegter Fork
+=======================================
+
+Dies ist ein **gewarteter Fork** von [BELABOX/srtla](https://github.com/BELABOX/srtla).
+Der ursprüngliche Entwickler pflegt insbesondere den Server-Teil `srtla_rec`
+nicht mehr weiter („unsupported, no longer under development"). Dieser Fork
+führt die Wartung fort – mit dem Fokus auf **Nachvollziehbarkeit** (der
+gesamte C-Code ist auf Deutsch kommentiert), **Robustheit** und **Build-Härtung**.
+
+> **Wichtig:** Das SRT-/SRTLA-Wire-Format wurde **nicht** verändert. Dieser
+> Fork bleibt voll kompatibel zu bestehenden Sendern (Belabox, Moblin, IRL Pro)
+> und zum unveränderten `srtla_send`. Geändert wurden nur interne Robustheit,
+> Kommentare, Build und Deployment.
+
+Was ist neu?
+------------
+
+Eine vollständige Liste steht in [`CHANGELOG.md`](CHANGELOG.md). Kurzfassung:
+
+* **Bugfix** in `srtla_rec.c` (`conn_reg`): Use-after-free im Fehlerpfad bei
+  Reconnects behoben.
+* **Socket-Tuning** im Receiver: `SO_REUSEADDR` + 8 MB Empfangs-/Sendepuffer
+  gegen Paketverluste bei hoher Bitrate.
+* **Sauberes Herunterfahren** (SIGTERM/SIGINT), `SIGPIPE`-Ignorieren,
+  `EINTR`-Behandlung.
+* **`inet_pton`** statt `inet_addr`, robusteres Port-Parsing.
+* **Gehärteter Build** (`-Wextra`, Stack-Protector, FORTIFY_SOURCE, RELRO/NOW)
+  – baut mit **0 Warnungen**.
+* **Gehärtete, kommentierte systemd-Unit** und kommentiertes `install.sh`.
+* **Gesamter Code auf Deutsch kommentiert.**
+
+Bauen
+-----
+
+    git clone https://github.com/Bittersweet1987/srtla.git
+    cd srtla
+    make
+
+Erzeugt die zwei Programme `srtla_send` und `srtla_rec`.
+
+Als Dienst installieren (Receiver/VPS)
+--------------------------------------
+
+    sudo deploy_srtla_rec/install.sh
+
+Das Skript baut bei Bedarf `srtla_rec`, kopiert es nach `/usr/local/bin`,
+legt `/etc/default/srtla_rec` an (Ports: SRTLA `8383`, SLS/SRT `8282`) und
+installiert/aktiviert die systemd-Unit. Eine vorhandene Konfiguration wird
+nicht überschrieben.
+
+Betriebs-Tuning: größere Kernel-Puffer (wichtig!)
+-------------------------------------------------
+
+Der Receiver fordert jetzt 8 MB Socket-Puffer an. Als unprivilegierter Dienst
+(User `nobody`) deckelt der Kernel diesen Wert aber auf `net.core.rmem_max` /
+`net.core.wmem_max`. Damit das Tuning voll greift, diese sysctls dauerhaft
+anheben:
+
+    # /etc/sysctl.d/99-srtla.conf
+    net.core.rmem_max = 8388608
+    net.core.wmem_max = 8388608
+
+Anwenden mit:
+
+    sudo sysctl --system
+
+------------------------------------------------------------------------------
+*Ab hier folgt die ursprüngliche README von BELABOX/srtla (Englisch, technische
+Referenz – Protokollbeschreibung, Beispielaufrufe, Hintergrund).*
+
 The server component - srtla_rec - in this repository is unsupported, no longer under development and not suitable for production deployment. Sign up for a [BELABOX cloud](https://belabox.net/cloud) account to benefit from the latest improvements, available on a global network of relay servers.
 =====
 

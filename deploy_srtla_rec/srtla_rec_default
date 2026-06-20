@@ -1,3 +1,12 @@
-# Options to pass to srtla_rec
-SRTLA_LISTEN_PORT="10000"
-SRT_ADDR="127.0.0.1 7000"
+# /etc/default/srtla_rec
+# Konfiguration fuer den srtla_rec-Dienst (wird von der systemd-Unit gelesen).
+#
+# SRTLA_LISTEN_PORT : UDP-Port, auf dem die Sender (Belabox/Moblin/IRL Pro)
+#                     ihre gebuendelten SRTLA-Pakete abliefern.
+# SRT_ADDR          : Adresse + Port des lokalen SRT-Servers (SLS), an den der
+#                     wieder zusammengesetzte Strom weitergereicht wird.
+#                     Format: "HOST PORT" (durch Leerzeichen getrennt).
+#
+# Standardwerte passen zum gaengigen IRL-Setup (SRTLA 8383, SLS/SRT 8282).
+SRTLA_LISTEN_PORT="8383"
+SRT_ADDR="127.0.0.1 8282"
