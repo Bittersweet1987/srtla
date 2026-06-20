@@ -29,8 +29,28 @@ Eine vollständige Liste steht in [`CHANGELOG.md`](CHANGELOG.md). Kurzfassung:
 * **Gehärtete, kommentierte systemd-Unit** und kommentiertes `install.sh`.
 * **Gesamter Code auf Deutsch kommentiert.**
 
-Bauen
------
+Komplett-Installer (SRT + SLS + SRTLA) für einen frischen VPS
+-------------------------------------------------------------
+
+Im Ordner [`install/`](install/) liegen fertige Installer für einen frischen
+Ubuntu-VPS. Sie bauen SRT (Haivision), SLS (srt-live-server) und diesen
+srtla-Fork, richten die systemd-Dienste + Firewall ein und fragen interaktiv
+nach einem Key für den srtla_rec-Stats-Endpoint.
+
+    # Ubuntu 24.04
+    curl -fsSL -o install.sh https://raw.githubusercontent.com/Bittersweet1987/srtla/main/install/install-srtla-sls-ubuntu-2404.sh
+    chmod +x install.sh && ./install.sh
+
+    # Ubuntu 26.04
+    curl -fsSL -o install.sh https://raw.githubusercontent.com/Bittersweet1987/srtla/main/install/install-srtla-sls-ubuntu-2604.sh
+    chmod +x install.sh && ./install.sh
+
+Erst herunterladen, dann starten – so funktioniert die interaktive Key-Abfrage.
+Bei `curl … | bash` (direkt durchgepipt) wird automatisch ein zufälliger Key
+erzeugt, weil dann keine Eingabe möglich ist.
+
+Bauen (nur srtla)
+-----------------
 
     git clone https://github.com/Bittersweet1987/srtla.git
     cd srtla
