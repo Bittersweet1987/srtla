@@ -10,3 +10,13 @@
 # Standardwerte passen zum gaengigen IRL-Setup (SRTLA 8383, SLS/SRT 8282).
 SRTLA_LISTEN_PORT="8383"
 SRT_ADDR="127.0.0.1 8282"
+
+# --- Optionaler Stats-/Status-Endpoint (Per-Modem-Auslastung) ---------------
+# STATS_PORT : TCP-Port fuer den Stats-Endpoint. Leer lassen = deaktiviert.
+# STATS_ADDR : Bind-Adresse. "127.0.0.1" = nur lokal (sicher),
+#              "0.0.0.0" = von aussen erreichbar (dann unbedingt STATS_KEY setzen!).
+# STATS_KEY  : Geheimer Schluessel. Abruf dann nur mit  ?key=DEIN_KEY
+#              Leer lassen = kein Schutz (wie der offene SLS-8181).
+STATS_PORT="8484"
+STATS_ADDR="127.0.0.1"
+STATS_KEY=""

@@ -6,7 +6,22 @@ nachvollziehbar (deutsche Kommentare) und robuster machen – **ohne das
 Wire-Format zu verändern**, damit bestehende Sender (Belabox, Moblin,
 IRL Pro) weiter kompatibel bleiben.
 
-## [Unreleased] – Wartungs- und Härtungsrunde
+## [Unreleased]
+
+### Hinzugefügt (Feature)
+- **Optionaler Stats-/Status-Endpoint in `srtla_rec`** (kleiner HTTP-Server).
+  Zeigt die Sicht *vor* dem Bündeln, die SLS' 8181-Statistik nicht liefern
+  kann: aktive Sender-Gruppen und die Last-Aufschlüsselung pro Link/Modem
+  (Adresse, Paket-/Byte-Zähler, Idle-Zeit). Antwort als JSON mit CORS `*`
+  (für Overlays/Dashboards). Konfiguration über Umgebungsvariablen:
+  `STATS_PORT` (leer = aus), `STATS_ADDR` (Default `127.0.0.1`),
+  `STATS_KEY` (Pflicht-Key über `?key=…`; leer = offen wie 8181).
+  Strikt read-only, alle Client-Sockets nicht-blockierend in der epoll-
+  Schleife (ein Client kann das Relay nicht blockieren), Client-Anzahl
+  gedeckelt, hängende Verbindungen werden eingesammelt. Die geheime
+  Gruppen-ID wird **nicht** ausgegeben (nur ein laufender Index).
+
+## [0.1.0] – Wartungs- und Härtungsrunde
 
 ### Behoben (Bugfixes)
 - **`srtla_rec.c` / `conn_reg()`: Use-after-free im Fehlerpfad.**

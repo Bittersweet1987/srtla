@@ -64,6 +64,39 @@ Anwenden mit:
 
     sudo sysctl --system
 
+Stats-/Status-Endpoint (optional)
+---------------------------------
+
+`srtla_rec` kann einen kleinen HTTP-Endpoint bereitstellen, der die
+**Auslastung pro Link/Modem** zeigt – also genau die Sicht, die SLS' 8181er
+Statistik nicht liefert (die kennt nur den bereits gebündelten Strom). Er wird
+ausschließlich über Umgebungsvariablen konfiguriert:
+
+| Variable     | Bedeutung                                                            |
+|--------------|---------------------------------------------------------------------|
+| `STATS_PORT` | TCP-Port. Nicht gesetzt/leer = Endpoint **aus**.                    |
+| `STATS_ADDR` | Bind-Adresse. Default `127.0.0.1`. `0.0.0.0` = von außen erreichbar. |
+| `STATS_KEY`  | Pflicht-Key. Abruf dann nur mit `?key=…`. Leer = offen (wie 8181).  |
+
+Abruf (JSON):
+
+    curl "http://DEINE_VPS_IP:8484/?key=DEIN_KEY"
+
+Beispielantwort:
+
+    {"version":"…","uptime_s":3600,"groups":1,"group_list":[
+      {"index":0,"srt_connected":true,"connections":[
+        {"addr":"10.0.0.5","port":1234,"idle_s":0,"pkts":84213,"bytes":121000000},
+        {"addr":"10.0.0.6","port":1235,"idle_s":1,"pkts":311,"bytes":410000}
+      ]}]}
+
+**Sicherheit:** Der Endpoint ist read-only und gibt die geheime Gruppen-ID
+nicht aus. Wird er nach außen geöffnet (`STATS_ADDR=0.0.0.0`), **immer** einen
+`STATS_KEY` setzen – sonst kann jeder die Modem-Adressen auslesen. Da der Key
+über HTTP (unverschlüsselt) läuft, ist für „richtig öffentlich" ein
+Reverse-Proxy mit HTTPS (Caddy/nginx) oder ein privates Netz (z. B. Tailscale)
+zu empfehlen.
+
 ------------------------------------------------------------------------------
 *Ab hier folgt die ursprüngliche README von BELABOX/srtla (Englisch, technische
 Referenz – Protokollbeschreibung, Beispielaufrufe, Hintergrund).*

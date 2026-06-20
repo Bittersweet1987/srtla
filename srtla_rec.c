@@ -65,8 +65,21 @@
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <errno.h>
+#include <stdint.h>          // NEU: uint64_t fuer die Stats-Paketzaehler
+#include <fcntl.h>           // NEU: O_NONBLOCK fuer die Stats-Client-Sockets
 
 #include "common.h"
+
+/* NEU: Unterscheidung, was hinter einem epoll-"userdata"-Zeiger steckt.
+   Bisher gab es nur NULL (SRTLA-Listener) und conn_group_t* (SRT-Socket einer
+   Gruppe). Fuer den Stats-Endpoint kommen zwei weitere Arten dazu. Damit wir
+   sie sicher auseinanderhalten koennen, beginnt jede dieser Strukturen mit
+   einem gemeinsamen int-Feld "kind". */
+typedef enum {
+  KIND_GROUP = 1,        // conn_group_t (SRT-Socket einer Gruppe)
+  KIND_STATS_LISTEN,     // lauschender TCP-Socket des Stats-Endpoints
+  KIND_STATS_CLIENT      // einzelne akzeptierte Stats-HTTP-Verbindung
+} epoll_kind_t;
 
 /* ---------------------------------------------------------------------------
    Ressourcen-Grenzen (DoS-Schutz). Diese Werte sind bewusst konservativ.
@@ -101,10 +114,13 @@ typedef struct srtla_conn {
   time_t last_rcvd;              // Zeitpunkt des letzten Empfangs (fuer Timeout)
   int recv_idx;                  // aktueller Schreibindex in recv_log
   uint32_t recv_log[RECV_ACK_INT]; // gepufferte Sequenznummern (big-endian) fuer die SRTLA-ACK
+  uint64_t pkts;                 // NEU (Stats): empfangene Pakete ueber diesen Link
+  uint64_t bytes;                // NEU (Stats): empfangene Bytes ueber diesen Link
 } conn_t;
 
 /* Eine Verbindungsgruppe = ein logischer Stream eines Senders. */
 typedef struct srtla_conn_group {
+  int kind;                      // NEU: immer KIND_GROUP (epoll-Unterscheidung)
   struct srtla_conn_group *next; // global verkettete Liste aller Gruppen
   conn_t *conns;                 // Liste der Links dieser Gruppe
   time_t created_at;             // Erstellzeit (fuer GROUP_TIMEOUT leerer Gruppen)
@@ -140,6 +156,54 @@ static void handle_exit_signal(int sig) {
   (void)sig;          // Parameter bewusst ungenutzt
   should_exit = 1;
 }
+
+/* ===========================================================================
+   NEU: Stats-/Status-Endpoint (optionaler kleiner HTTP-Server)
+
+   Zweck: Sichtbarkeit, die SLS' 8181-Statistik NICHT liefern kann - naemlich
+   die Aufschluesselung VOR dem Buendeln: wie viele Sender-Gruppen aktiv sind
+   und wie sich die Last auf die einzelnen Links (Modems) verteilt.
+
+   Konfiguration ausschliesslich ueber Umgebungsvariablen, damit ein Key nicht
+   in der Prozessliste (ps aux) auftaucht:
+     STATS_PORT  - TCP-Port; leer/0/nicht gesetzt => Endpoint deaktiviert
+     STATS_ADDR  - Bind-Adresse (Default 127.0.0.1; "0.0.0.0" = von aussen)
+     STATS_KEY   - Pflicht-Schluessel; leer => kein Schutz (wie der offene 8181)
+
+   Abruf:  GET /?key=DEIN_KEY    -> 200 + JSON
+           ohne/falscher Key     -> 403
+   Antwort enthaelt CORS "*", damit Overlay-/Dashboard-Tools sie laden koennen.
+
+   Sicherheits-/Robustheitsdesign (wichtig, da potenziell aus dem Internet
+   erreichbar): Der Endpoint ist strikt READ-ONLY. Alle Client-Sockets sind
+   nicht-blockierend und haengen in derselben epoll-Schleife - ein stiller
+   oder boesartiger Client kann die Relay-Schleife also NICHT anhalten. Die
+   Zahl gleichzeitiger Stats-Clients ist gedeckelt, haengende Clients werden
+   im normalen Cleanup nach kurzer Zeit eingesammelt.
+   =========================================================================== */
+#define STATS_MAX_CLIENTS    16      // gleichzeitige Stats-Verbindungen (DoS-Schutz)
+#define STATS_REQ_MAX        2048    // max. Groesse einer eingehenden Anfrage
+#define STATS_CLIENT_TIMEOUT 5       // Sekunden, dann wird ein haengender Client gekappt
+#define STATS_JSON_CAP       (256*1024) // Obergrenze fuer die JSON-Antwort
+
+int   stats_listen_sock = -1;        // -1 => Endpoint deaktiviert
+int   stats_kind_listen = KIND_STATS_LISTEN; // als epoll-Tag des Listeners
+char  stats_key[128]    = "";        // erwarteter Key ("" => kein Schutz)
+int   stats_key_len     = 0;
+time_t start_time       = 0;         // fuer die Uptime-Anzeige
+
+/* Eine einzelne akzeptierte Stats-HTTP-Verbindung. */
+typedef struct stats_client {
+  int kind;                          // immer KIND_STATS_CLIENT (epoll-Unterscheidung)
+  int fd;
+  time_t created_at;
+  int req_used;                      // bereits gelesene Bytes der Anfrage
+  char req[STATS_REQ_MAX];
+  struct stats_client *next;
+} stats_client_t;
+
+stats_client_t *stats_clients = NULL;
+int stats_client_count = 0;
 
 /* ===========================================================================
    Async-I/O via epoll
@@ -274,6 +338,7 @@ conn_group_t *group_create(char *sender_id, time_t ts) {
 
   // Mit der oben gebildeten ID initialisieren
   memcpy(&g->id, id, SRTLA_ID_LEN);
+  g->kind = KIND_GROUP;          // NEU: fuer die epoll-Unterscheidung
   g->conns = NULL;
   g->srt_sock = -1;
   g->created_at = ts;
@@ -428,6 +493,8 @@ int conn_reg(struct sockaddr *addr, char *in_buf, time_t ts) {
     c->addr = *addr;
     c->recv_idx = 0;
     c->last_rcvd = ts;
+    c->pkts = 0;                 // NEU (Stats)
+    c->bytes = 0;                // NEU (Stats)
     c->next = g->conns;
     g->conns = c;            // neuer Link wird Kopf der Liste
     newly_allocated = 1;
@@ -562,6 +629,10 @@ void handle_srtla_data(time_t ts) {
 
   // Empfangszeitpunkt des Links aktualisieren (gegen Timeout)
   c->last_rcvd = ts;
+
+  // NEU (Stats): Pro-Link-Zaehler hochzaehlen (zeigt, welches Modem traegt)
+  c->pkts++;
+  c->bytes += (uint64_t)n;
 
   // SRTLA-Keepalives einfach zuruecksenden
   if (is_srtla_keepalive(buf, n)) {
@@ -767,6 +838,294 @@ int resolve_srt_addr(char *host, char *port) {
 /* NEU: Empfangs-/Sende-Puffer eines Sockets best-effort vergroessern.
    Schlaegt es fehl (z. B. wegen net.core.rmem_max), ist das nicht fatal -
    wir geben nur eine Warnung aus und laufen weiter. */
+/* NEU: einen Deskriptor auf nicht-blockierend schalten. */
+static int set_nonblock(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* Eine Stats-Client-Verbindung schliessen, aus epoll und Liste entfernen. */
+static void stats_client_close(stats_client_t *sc) {
+  epoll_rem(sc->fd);
+  close(sc->fd);
+  for (stats_client_t **it = &stats_clients; *it != NULL; it = &((*it)->next)) {
+    if (*it == sc) { *it = sc->next; break; }
+  }
+  free(sc);
+  stats_client_count--;
+}
+
+/* Die JSON-Antwort in buf bauen. Gibt die Laenge zurueck (immer < cap).
+   Wir zaehlen pro Gruppe nur einen fortlaufenden Index aus - die geheime
+   256-Byte-Gruppen-ID wird BEWUSST NICHT ausgegeben (sie ist das
+   Registrierungs-Geheimnis und darf nicht nach aussen gelangen). */
+static int stats_build_json(char *buf, int cap, time_t now) {
+  int o = 0;
+  #define APPEND(...) do { \
+    if (o < cap) o += snprintf(buf + o, cap - o, __VA_ARGS__); \
+    if (o >= cap) o = cap - 1; \
+  } while (0)
+
+  APPEND("{\"version\":\"%s\",\"uptime_s\":%ld,\"groups\":%d,\"group_list\":[",
+         VERSION, (long)(now - start_time), group_count);
+
+  int gi = 0;
+  for (conn_group_t *g = groups; g != NULL; g = g->next) {
+    APPEND("%s{\"index\":%d,\"srt_connected\":%s,\"connections\":[",
+           (gi == 0 ? "" : ","), gi, (g->srt_sock >= 0 ? "true" : "false"));
+    int ci = 0;
+    for (conn_t *c = g->conns; c != NULL; c = c->next) {
+      APPEND("%s{\"addr\":\"%s\",\"port\":%d,\"idle_s\":%ld,\"pkts\":%llu,\"bytes\":%llu}",
+             (ci == 0 ? "" : ","),
+             print_addr(&c->addr), port_no(&c->addr),
+             (long)(now - c->last_rcvd),
+             (unsigned long long)c->pkts, (unsigned long long)c->bytes);
+      ci++;
+    }
+    APPEND("]}");
+    gi++;
+  }
+
+  APPEND("]}");
+  #undef APPEND
+  return o;
+}
+
+/* Eine fertige Anfrage beantworten und die Verbindung schliessen.
+   Der Schreibvorgang ist best-effort nicht-blockierend: kleine Antworten (der
+   Normalfall) gehen in einem Rutsch raus; im seltenen Fall, dass der Kernel-
+   Puffer voll ist, wird kurz nachgefasst und sonst einfach geschlossen (der
+   Betrachter laedt eben neu). So kann kein Client die Relay-Schleife blockieren. */
+static void stats_send_and_close(stats_client_t *sc, const char *status,
+                                 const char *ctype, const char *body, int body_len) {
+  char head[256];
+  int hl = snprintf(head, sizeof(head),
+                    "HTTP/1.1 %s\r\n"
+                    "Content-Type: %s\r\n"
+                    "Content-Length: %d\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Connection: close\r\n\r\n",
+                    status, ctype, body_len);
+
+  // Header und Body best-effort senden (max. ~50 ms, dann aufgeben)
+  const char *parts[2] = { head, body };
+  int lens[2] = { hl, body_len };
+  for (int p = 0; p < 2; p++) {
+    int sent = 0;
+    int tries = 0;
+    while (sent < lens[p] && tries < 50) {
+      int w = send(sc->fd, parts[p] + sent, lens[p] - sent, MSG_NOSIGNAL);
+      if (w > 0) { sent += w; continue; }
+      if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        usleep(1000); tries++; continue;       // kurz warten, dann erneut
+      }
+      break;                                     // echter Fehler -> abbrechen
+    }
+  }
+
+  stats_client_close(sc);
+}
+
+/* Pruefen, ob die Anfrage einen gueltigen Key traegt (falls einer verlangt wird).
+   Sucht "key=" in der ersten Zeile (Query-String) und vergleicht konstant-zeitig. */
+static int stats_key_ok(const char *req) {
+  if (stats_key_len == 0) return 1;          // kein Key konfiguriert => offen
+
+  // Nur die erste Zeile (Request-Line) betrachten
+  const char *eol = strstr(req, "\r\n");
+  size_t line_len = eol ? (size_t)(eol - req) : strlen(req);
+
+  const char *p = req;
+  while (p < req + line_len) {
+    const char *k = strstr(p, "key=");
+    if (k == NULL || k >= req + line_len) break;
+    k += 4;
+    // Wert bis zum naechsten Trenner (& Leerzeichen) abgreifen
+    const char *e = k;
+    while (e < req + line_len && *e != '&' && *e != ' ' && *e != '\r') e++;
+    if ((e - k) == stats_key_len &&
+        const_time_cmp(k, stats_key, stats_key_len) == 0) {
+      return 1;
+    }
+    p = e;
+  }
+  return 0;
+}
+
+/* Daten eines Stats-Clients lesen und - sobald die Anfrage komplett ist -
+   beantworten. Wird aus der epoll-Schleife aufgerufen. */
+static void stats_handle_client(stats_client_t *sc, time_t now) {
+  // So viel lesen, wie in den Restpuffer passt (nicht-blockierend)
+  int space = STATS_REQ_MAX - 1 - sc->req_used;
+  if (space <= 0) { stats_client_close(sc); return; }   // Anfrage zu gross
+
+  int n = recv(sc->fd, sc->req + sc->req_used, space, 0);
+  if (n == 0) { stats_client_close(sc); return; }        // Gegenstelle zu
+  if (n < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return; // spaeter weiter
+    stats_client_close(sc);
+    return;
+  }
+  sc->req_used += n;
+  sc->req[sc->req_used] = '\0';
+
+  // Auf das Ende der HTTP-Anfragezeilen warten (Leerzeile) - oder mind. CRLF
+  if (strstr(sc->req, "\r\n\r\n") == NULL && strstr(sc->req, "\r\n") == NULL) {
+    return; // noch unvollstaendig
+  }
+
+  // Nur GET wird unterstuetzt
+  if (strncmp(sc->req, "GET ", 4) != 0) {
+    const char *b = "{\"error\":\"method_not_allowed\"}";
+    stats_send_and_close(sc, "405 Method Not Allowed", "application/json", b, strlen(b));
+    return;
+  }
+
+  // Key pruefen
+  if (!stats_key_ok(sc->req)) {
+    const char *b = "{\"error\":\"forbidden\"}";
+    stats_send_and_close(sc, "403 Forbidden", "application/json", b, strlen(b));
+    return;
+  }
+
+  // JSON bauen und ausliefern
+  char *json = malloc(STATS_JSON_CAP);
+  if (json == NULL) {
+    const char *b = "{\"error\":\"oom\"}";
+    stats_send_and_close(sc, "500 Internal Server Error", "application/json", b, strlen(b));
+    return;
+  }
+  int jl = stats_build_json(json, STATS_JSON_CAP, now);
+  stats_send_and_close(sc, "200 OK", "application/json", json, jl);
+  free(json);
+}
+
+/* Neue Verbindungen am Stats-Listener annehmen (nicht-blockierend). */
+static void stats_handle_accept(time_t now) {
+  while (1) {
+    int fd = accept(stats_listen_sock, NULL, NULL);
+    if (fd < 0) {
+      // EAGAIN/EWOULDBLOCK => keine weiteren wartenden Verbindungen
+      break;
+    }
+
+    // Bei Ueberlast: sofort wieder schliessen (DoS-Schutz)
+    if (stats_client_count >= STATS_MAX_CLIENTS) {
+      close(fd);
+      continue;
+    }
+
+    if (set_nonblock(fd) != 0) { close(fd); continue; }
+
+    stats_client_t *sc = calloc(1, sizeof(stats_client_t));
+    if (sc == NULL) { close(fd); continue; }
+    sc->kind = KIND_STATS_CLIENT;
+    sc->fd = fd;
+    sc->created_at = now;
+    sc->req_used = 0;
+
+    if (epoll_add(fd, EPOLLIN, sc) != 0) {
+      close(fd); free(sc);
+      continue;
+    }
+
+    sc->next = stats_clients;
+    stats_clients = sc;
+    stats_client_count++;
+  }
+}
+
+/* Haengende Stats-Clients (verbunden, aber keine vollstaendige Anfrage)
+   nach STATS_CLIENT_TIMEOUT Sekunden einsammeln. */
+static void stats_cleanup(time_t now) {
+  stats_client_t *next;
+  for (stats_client_t *sc = stats_clients; sc != NULL; sc = next) {
+    next = sc->next;
+    if ((sc->created_at + STATS_CLIENT_TIMEOUT) < now) {
+      stats_client_close(sc);
+    }
+  }
+}
+
+/* Stats-Endpoint initialisieren (aus Umgebungsvariablen). Tut nichts, wenn
+   STATS_PORT nicht gesetzt/0 ist - dann verhaelt sich srtla_rec wie bisher. */
+static void stats_init() {
+  const char *port_s = getenv("STATS_PORT");
+  if (port_s == NULL || *port_s == '\0') return;     // deaktiviert
+  int port = parse_port((char *)port_s);
+  if (port < 0) {
+    err("warning: invalid STATS_PORT, stats endpoint disabled\n");
+    return;
+  }
+
+  const char *addr_s = getenv("STATS_ADDR");
+  if (addr_s == NULL || *addr_s == '\0') addr_s = "127.0.0.1";
+
+  const char *key_s = getenv("STATS_KEY");
+  if (key_s != NULL) {
+    size_t kl = strlen(key_s);
+    if (kl >= sizeof(stats_key)) {
+      err("warning: STATS_KEY too long, stats endpoint disabled\n");
+      return;
+    }
+    memcpy(stats_key, key_s, kl);
+    stats_key_len = (int)kl;
+  }
+
+  struct sockaddr_in sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(port);
+  if (inet_pton(AF_INET, addr_s, &sa.sin_addr) != 1) {
+    err("warning: invalid STATS_ADDR '%s', stats endpoint disabled\n", addr_s);
+    return;
+  }
+
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) { err("warning: stats socket() failed\n"); return; }
+
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    err("warning: stats bind() to %s:%d failed, endpoint disabled\n", addr_s, port);
+    close(fd);
+    return;
+  }
+  if (listen(fd, 8) != 0) {
+    err("warning: stats listen() failed, endpoint disabled\n");
+    close(fd);
+    return;
+  }
+  if (set_nonblock(fd) != 0) {
+    err("warning: stats set_nonblock() failed, endpoint disabled\n");
+    close(fd);
+    return;
+  }
+  if (epoll_add(fd, EPOLLIN, &stats_kind_listen) != 0) {
+    err("warning: stats epoll_add() failed, endpoint disabled\n");
+    close(fd);
+    return;
+  }
+
+  stats_listen_sock = fd;
+  info("stats endpoint listening on %s:%d (%s)\n", addr_s, port,
+       stats_key_len > 0 ? "key required" : "no key - OPEN");
+}
+
+/* Beim Herunterfahren alle Stats-Ressourcen freigeben. */
+static void stats_shutdown() {
+  while (stats_clients != NULL) {
+    stats_client_close(stats_clients);
+  }
+  if (stats_listen_sock >= 0) {
+    epoll_rem(stats_listen_sock);
+    close(stats_listen_sock);
+    stats_listen_sock = -1;
+  }
+}
+
 static void tune_socket_buffers(int fd) {
   int sz = SOCK_BUF_SIZE;
   if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) != 0) {
@@ -851,6 +1210,10 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
+  // NEU: optionalen Stats-Endpoint starten (nur falls STATS_PORT gesetzt ist)
+  get_seconds(&start_time);
+  stats_init();
+
   info("srtla_rec is now running\n");
 
   // ----- Hauptschleife: auf Netzwerk-Ereignisse warten und verteilen -----
@@ -873,31 +1236,43 @@ int main(int argc, char **argv) {
       err("Failed to get the timestamp\n");
     }
 
-    int group_cnt;
+    int group_cnt, stats_cnt;
     for (int i = 0; i < eventcnt; i++) {
       group_cnt = group_count;
-      if (events[i].data.ptr == NULL) {
+      stats_cnt = stats_client_count;
+      void *ptr = events[i].data.ptr;
+      if (ptr == NULL) {
         // userdata == NULL -> Ereignis auf dem globalen SRTLA-Listener
         handle_srtla_data(ts);
       } else {
-        // userdata == Gruppe -> Ereignis auf dem SRT-Socket dieser Gruppe
-        handle_srt_data((conn_group_t*)events[i].data.ptr);
+        /* Alle Nicht-NULL-Tags beginnen mit einem int "kind", an dem wir
+           erkennen, um welche Art Socket es sich handelt. */
+        int kind = *(int *)ptr;
+        if (kind == KIND_GROUP) {
+          handle_srt_data((conn_group_t *)ptr);
+        } else if (kind == KIND_STATS_LISTEN) {
+          stats_handle_accept(ts);
+        } else if (kind == KIND_STATS_CLIENT) {
+          stats_handle_client((stats_client_t *)ptr, ts);
+        }
       }
 
-      /* Falls wir eine Gruppe wegen eines Socket-Fehlers entfernt haben,
-         koennten in events[] noch Ereignisse stehen, die auf jetzt
-         freigegebenen Speicher zeigen. In dem Fall die Schleife abbrechen
-         und eine frische Liste von epoll_wait() holen. */
-      if (group_count < group_cnt) break;
+      /* Falls wir eine Gruppe oder einen Stats-Client wegen eines Fehlers
+         entfernt haben, koennten in events[] noch Eintraege auf jetzt
+         freigegebenen Speicher zeigen. Dann die Schleife abbrechen und eine
+         frische Ereignisliste von epoll_wait() holen. */
+      if (group_count < group_cnt || stats_client_count < stats_cnt) break;
     } // for
 
     connection_cleanup(ts);
+    stats_cleanup(ts);          // NEU: haengende Stats-Clients einsammeln
   } // while
 
   /* NEU: geordnetes Herunterfahren - alle Gruppen abbauen und Ressourcen
      freigeben. Nicht zwingend noetig (der Prozess endet ohnehin), aber sauber
      fuer die Logs und fuer Werkzeuge wie valgrind. */
   info("srtla_rec is shutting down\n");
+  stats_shutdown();             // NEU: Stats-Listener + Clients schliessen
   while (groups != NULL) {
     group_destroy(groups, NULL);
   }
