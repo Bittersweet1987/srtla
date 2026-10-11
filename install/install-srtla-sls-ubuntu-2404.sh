@@ -110,6 +110,32 @@ echo "Enabling the firewall service"
 echo "y" | sudo ufw enable
 echo "Firewall enabled"
 
+# Cloud-Images (z. B. Oracle Cloud) liefern iptables-Regeln mit, in denen eine
+# REJECT-Regel VOR den UFW-Chains steht - dann greifen die UFW-Regeln nie.
+# Daher die Ports zusaetzlich direkt vor dem ersten REJECT in INPUT freigeben.
+if command -v iptables >/dev/null 2>&1 && sudo iptables -L INPUT -n >/dev/null 2>&1; then
+    REJECT_LINE="$(sudo iptables -L INPUT --line-numbers -n | awk '$2 == "REJECT" { print $1; exit }')"
+    if [ -n "$REJECT_LINE" ]; then
+        echo "iptables-REJECT-Regel gefunden (Zeile $REJECT_LINE) - oeffne Ports davor."
+        open_iptables_port() {
+            local proto="$1" port="$2"
+            if ! sudo iptables -C INPUT -p "$proto" -m "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+                sudo iptables -I INPUT "$REJECT_LINE" -p "$proto" -m "$proto" --dport "$port" -m comment --comment srtla-setup -j ACCEPT
+                REJECT_LINE=$((REJECT_LINE + 1))
+            fi
+        }
+        open_iptables_port tcp "$SLS_HTTP_PORT"
+        open_iptables_port udp "$SLS_SRT_PORT"
+        open_iptables_port udp "$SRTLA_PORT"
+        if [ "$STATS_ENABLED" -eq 1 ]; then
+            open_iptables_port tcp "$STATS_PORT"
+        fi
+        if [ -d /etc/iptables ]; then
+            sudo sh -c 'iptables-save > /etc/iptables/rules.v4'
+        fi
+    fi
+fi
+
 echo "Downloading and installing SRT Server (v1.5.3). This can take a few minutes."
 cd "$USER_HOME"
 if [ ! -d srt ]; then
@@ -282,6 +308,9 @@ echo ""
 fi
 echo "Hinweis: 'feed1' ist frei waehlbar, kann durch jeden beliebigen Namen ersetzt werden,"
 echo "ohne dass die Config angepasst werden muss (z.B. feed2, kamera1, x7k29fa, ...)."
+echo ""
+echo "Cloud-Anbieter (Oracle, AWS, Azure, ...): Ports ${SRTLA_PORT}/udp und ${SLS_SRT_PORT}/udp zusaetzlich in der"
+echo "Firewall/Security-List der Cloud-Konsole freigeben, sonst kommt keine Verbindung zustande."
 echo ""
 echo "Status pruefen mit:"
 echo "  sudo systemctl status sls.service"
